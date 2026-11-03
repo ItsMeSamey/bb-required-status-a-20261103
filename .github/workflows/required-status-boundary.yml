@@ -1,0 +1,121 @@
+name: required-status-boundary
+on:
+  workflow_dispatch:
+    inputs:
+      b_sha:
+        description: Exact synthetic B PR head SHA
+        required: true
+        type: string
+permissions:
+  statuses: write
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Inspect A-only token grant and send bounded status controls
+        env:
+          GH_TOKEN: ${{ github.token }}
+          B_SHA: ${{ inputs.b_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          A_REPO='ItsMeSamey/bb-required-status-a-20261103'
+          B_REPO='ItsMeSamey/bb-required-status-b-20261103'
+          test "$GITHUB_REPOSITORY" = "$A_REPO"
+          [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$B_SHA" =~ ^[0-9a-f]{40}$ ]]
+          echo "run_id=$GITHUB_RUN_ID run_attempt=$GITHUB_RUN_ATTEMPT a_repo=$A_REPO a_sha=$GITHUB_SHA b_repo=$B_REPO b_sha=$B_SHA"
+          scope_file="$RUNNER_TEMP/installation-repositories.json"
+          scope_code="$(curl --silent --show-error --max-time 20 --connect-timeout 5 --max-filesize 131072 --retry 0 \
+            --output "$scope_file" --write-out '%{http_code}' \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header 'Accept: application/vnd.github+json' \
+            --header 'X-GitHub-Api-Version: 2026-03-10' \
+            'https://api.github.com/installation/repositories?per_page=100')"
+          echo "scope_http=$scope_code"
+          test "$scope_code" = 200
+          jq -e --arg a "$A_REPO" --arg b "$B_REPO" \
+            '.total_count == 1 and ([.repositories[].full_name] == [$a]) and ([.repositories[].full_name] | index($b) == null)' \
+            "$scope_file" >/dev/null
+          echo 'scope_exactly_A=true; scope_B_absent=true'
+
+          post_status() {
+            local repo="$1" sha="$2" state="$3" context="$4" desc="$5" label="$6"
+            local request_file="$RUNNER_TEMP/$label-request.json"
+            local response_file="$RUNNER_TEMP/$label-response.json"
+            local code
+            jq -nc --arg state "$state" --arg context "$context" --arg description "$desc" \
+              '{state:$state,context:$context,description:$description}' > "$request_file"
+            if ! code="$(curl --silent --show-error --max-time 20 --connect-timeout 5 --max-filesize 32768 --retry 0 \
+              --request POST --output "$response_file" --write-out '%{http_code}' \
+              --header "Authorization: Bearer $GH_TOKEN" \
+              --header 'Accept: application/vnd.github+json' \
+              --header 'X-GitHub-Api-Version: 2026-03-10' \
+              --header 'Content-Type: application/json' \
+              --data-binary "@$request_file" \
+              "https://api.github.com/repos/$repo/statuses/$sha")"; then
+              echo "$label-result=uncertain_transport"
+              exit 2
+            fi
+            echo "$label-http=$code"
+            if ! jq -e . "$response_file" >/dev/null; then
+              echo "$label-result=uncertain_response"
+              exit 2
+            fi
+            jq -c --arg desc "$desc" '{id:(if (.id | type) == "number" then .id else null end),state:((.state // "") | tostring | .[:32]),context:((.context // "") | tostring | .[:100]),description_matches:(.description == $desc),creator:((.creator.login // "") | tostring | .[:100])}' "$response_file"
+            POST_STATUS_CODE="$code"
+            if test "$label" = a_control; then
+              test "$code" = 201
+              jq -e --arg context "$context" \
+                '.context == $context and .state == "success" and (.id | type == "number")' \
+                "$response_file" >/dev/null
+            fi
+          }
+
+          post_status "$A_REPO" "$GITHUB_SHA" success status-scope-a-control \
+            "a-control/$GITHUB_RUN_ID/$GITHUB_RUN_ATTEMPT" a_control
+          a_id="$(jq -er '.id' "$RUNNER_TEMP/a_control-response.json")"
+          a_list_file="$RUNNER_TEMP/a-statuses.json"
+          a_list_code="$(curl --silent --show-error --max-time 20 --connect-timeout 5 --max-filesize 32768 --retry 0 \
+            --output "$a_list_file" --write-out '%{http_code}' \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header 'Accept: application/vnd.github+json' \
+            --header 'X-GitHub-Api-Version: 2026-03-10' \
+            "https://api.github.com/repos/$A_REPO/commits/$GITHUB_SHA/statuses")"
+          echo "a_readback_http=$a_list_code"
+          test "$a_list_code" = 200
+          jq -e --argjson id "$a_id" --arg desc "a-control/$GITHUB_RUN_ID/$GITHUB_RUN_ATTEMPT" \
+            'any(.[]; .id == $id and .context == "status-scope-a-control" and .state == "success" and .description == $desc)' \
+            "$a_list_file" >/dev/null
+          echo "a_readback_id=$a_id"
+          nonce="b-probe/$GITHUB_RUN_ID/$GITHUB_RUN_ATTEMPT"
+          echo "b_probe_nonce=$nonce"
+          post_status "$B_REPO" "$B_SHA" success triage-ci "$nonce" b_probe
+          case "$POST_STATUS_CODE" in
+            201)
+              if jq -e --arg desc "$nonce" \
+                '.context == "triage-ci" and .state == "success" and .description == $desc and (.id | type == "number")' \
+                "$RUNNER_TEMP/b_probe-response.json" >/dev/null; then
+                echo 'b_probe_result=provisional_created_pending_B_readback_and_PR_gate'
+              else
+                echo 'b_probe_result=uncertain_created_response'
+                exit 2
+              fi
+              ;;
+            403|404)
+              b_error="$(jq -r '.message // ""' "$RUNNER_TEMP/b_probe-response.json")"
+              case "$b_error" in
+                'Resource not accessible by integration'|'Not Found'|'Must have push access to repository')
+                  echo 'b_probe_result=denied_pending_B_readback'
+                  ;;
+                *)
+                  echo 'b_probe_result=uncertain_denial_category'
+                  exit 2
+                  ;;
+              esac
+              ;;
+            *)
+              echo 'b_probe_result=uncertain_http'
+              exit 2
+              ;;
+          esac
